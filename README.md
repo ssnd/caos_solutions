@@ -12,7 +12,7 @@
 
 
 # Использование
-`bash
+```bash
 Usage: ejudge_parser.py [OPTIONS]
 
 Options:
@@ -28,4 +28,4 @@ Options:
   --save_folder TEXT    path to save to problems to (default `./content`)
   --ejudge_url TEXT     ejudge url (default `https://ejudge.atp-fivt.org`)
   --help                Show this message and exit.
-`
+```
