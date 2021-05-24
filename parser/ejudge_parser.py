@@ -1,35 +1,66 @@
+#! .env/bin/python
+
 from operator import attrgetter
 from typing import Union
-
+import yaml
 import bs4
+import os
 import requests
+import click
 import re
+import time
 from collections import namedtuple
 import logging
 
-logger = logging.getLogger("ejudge_parser")
 logging.basicConfig(level=logging.DEBUG)
 
-Solution = namedtuple("Solution", "id, name, status, source")
+Solution = namedtuple("Solution", "id, name, status, source, lang")
 
 
 class Parser:
-    def __init__(self):
+    def __init__(self, username , password, contest_id, 
+                 save_to_folder="./content", 
+                 ejudge_url="https://ejudge.atp-fivt.org"):
         self.session: requests.Session = requests.Session()
+
+        self.ejudge_url = ejudge_url
+        self.username = username    
+        self.password = password
+        self.contest_id = contest_id
+        self.sleep_time=1
+        self.create_folders = True
+        self.save_to_folder = save_to_folder
+
+        self.formats = self.prep_formats("./lang_formats.yml")
+        self.logger = logging.getLogger("ejudge_parser")
+
+    def prep_formats(self, path):
+        try:
+            with open(path, "r") as f:
+                return yaml.load(f, Loader=yaml.FullLoader)
+        except IOError as e:
+            self.logger.error("io error", exc_info=True)
+            return {}
+        except yaml.scanner.ScannerError as e:
+            self.logger.error("wrong yaml format", exc_info=True)
+            return {}
 
     def login(self):
         # Fill in your details here to be posted to the login form.
         payload = {
-            'contest_id': '3',
+            'contest_id': self.contest_id,
             'role': '0',
-            'prob_name': '',
-            'login': '',
-            'password': '',
+            'login': self.username,
+            'password': self.password,
             "locale_id": 0,
             "action_2": "Log in",
         }
-        p = self.session.post('https://ejudge.atp-fivt.org/client', data=payload)
-        soup: bs4.BeautifulSoup = bs4.BeautifulSoup(p.content)
+
+        assert len(payload['login']) !=0 and len(payload['password']) !=0 , "No login info"
+        assert len(payload['contest_id']) != 0, "No contest id"
+
+        p = self.session.post(f'{self.ejudge_url}/client', data=payload)
+        soup: bs4.BeautifulSoup = bs4.BeautifulSoup(p.content,features="html.parser")
 
         links: bs4.ResultSet = soup.find_all("a", href=True)
 
@@ -41,7 +72,7 @@ class Parser:
 
         sid_list: list = re.findall("SID=(.*)&", link_text)
 
-        assert len(sid_list) == 1
+        assert len(sid_list) == 1, "No session token"
         self.sid: str = sid_list[0]
 
     @staticmethod
@@ -49,10 +80,11 @@ class Parser:
         parsed_row = row.findAll("td")
         id: int = int(parsed_row[0].text)
         name: str = parsed_row[3].text
+        lang: str = parsed_row[4].text
         status: str = parsed_row[5].text
         source: str = parsed_row[8].find('a').attrs['href']
 
-        return Solution(id, name, status, source)
+        return Solution(id, name, status, source, lang)
 
     def convert_table_to_list(self, rows: bs4.ResultSet) -> list:
         solution_list: list = []
@@ -79,44 +111,92 @@ class Parser:
         code = c.find('code')
         return code.text
 
-    def download_solution(self, solution, path):
+    def download_solution(self, solution):
+        if self.create_folders:
+            prob_path = f"{self.save_to_folder}/{solution.name}"
+        else:
+            prob_path = f"{self.save_to_folder}"
+
+        if self.create_folders:
+            try:
+                os.makedirs(f"{prob_path}", exist_ok=True)
+            except OSError:
+                self.logger.error(f"failed to create path={prob_path}")
+            else:
+                self.logger.debug(f"path {prob_path} created successfully")
+
         r = self.session.get(solution.source)
-        soup = bs4.BeautifulSoup(r.content)
+        soup = bs4.BeautifulSoup(r.content, features="html.parser")
         code = self.find_code(soup)
-        with open(f"{path}/{solution.name}.txt", "w") as f:
+
+        lang = self.formats.get(solution.lang)
+        if self.formats and lang:
+            format = lang
+        else:
+            format = "txt"
+
+        with open(f"{prob_path}/{solution.name}.{format}", "w") as f:
             f.write(code)
 
-        logger.info(f"problem {solution.name} saved")
+        self.logger.info(f"problem {solution.name} saved")
 
     def parse_problem(self, problem_id: int) -> None:
-        url = f"https://ejudge.atp-fivt.org/client?SID={self.sid}&action=139&prob_id={problem_id}"
+        url = f"{self.ejudge_url}/client?SID={self.sid}&action=139&prob_id={problem_id}"
         r = self.session.get(url)
-        soup: bs4.BeautifulSoup = bs4.BeautifulSoup(r.content)
+        soup: bs4.BeautifulSoup = bs4.BeautifulSoup(r.content,features="html.parser")
 
         problem_container: Union[bs4.BeautifulSoup, bs4.NavigableString] = soup.find("table", class_="probNav")
         table: Union[bs4.Tag, bs4.NavigableString, int] = problem_container.find("table", class_="table")
         if table is None:
-            logger.error(f"parsing error at id = {problem_id}")
+            self.logger.error(f"parsing error at id = {problem_id}")
             return
         table_rows: bs4.ResultSet = table.findAll("tr")
         problem_list = self.convert_table_to_list(table_rows[1:])
         if len(problem_list) == 0:
-            logger.error("solution list empty")
+            self.logger.error("solution list empty")
             return
 
         filtered_problems = self.sort_by_status(problem_list)
         if len(filtered_problems) == 0:
-            logger.error("didn't find any correct solutions")
+            self.logger.error("didn't find any correct solutions")
             return
 
         solution: Solution = filtered_problems[0]
-        self.download_solution(solution, f"./content/")
+        self.download_solution(solution)
 
-    def run(self):
+    def run(self, count):
         self.login()
-        for i in range(0, 50):
+        for i in range(1, 1+count):
             self.parse_problem(i)
+            time.sleep(self.sleep_time)
 
 
-if __name__ == "__main__":
-    Parser().run()
+@click.command()
+@click.option('--count', prompt="Problem count",
+                         default=1,
+                         help='Number of problems the script should download (starting with id=1).')
+@click.option('--username', prompt='Ejudge username', 
+                            help='This script uses your username/pass to access the ejudge interface.')
+@click.option('--password', prompt='Ejudge password', 
+                            help='This script uses your username/pass to access the ejudge interface.')
+@click.option('--contest_id', prompt='Ejudge contest id', 
+                            help='Contest id to use (you can find it in your ejudge login interface url with the url key `contest_id`)')
+@click.option('--problem_id', default=0, 
+                              help='Problem id to download, (--count ignored if true)')
+@click.option('--save_folder', default="./content/", 
+                               help='path to save to problems to')
+@click.option('--ejudge_url', default="https://ejudge.atp-fivt.org", 
+                               help='ejudge url')
+def cli(username, password, contest_id, count, problem_id, save_folder, ejudge_url):
+    parser = Parser(username, password, contest_id, 
+                    save_to_folder=save_folder, 
+                    ejudge_url=ejudge_url)
+    if problem_id == 0:
+        parser.run(count)
+    else:
+        parser.parse_problem(problem_id)
+
+if __name__ == '__main__':
+    cli()
+
+
